@@ -7,6 +7,7 @@ independent of row order and directory order.
 """
 
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -272,8 +273,8 @@ class TestHmmCandidateEvidenceWriter(unittest.TestCase):
         self.assertEqual(by_protein[protein_a]["miniprot_score"], "80")
         self.assertEqual(by_protein[protein_a]["hmm_score"], "91.000000")
         self.assertEqual(by_protein[protein_a]["locus_id"], location)
-        self.assertIn("compleasm_hmm_evidence_schema_version=1", text)
-        self.assertTrue(text.strip().splitlines()[-1].startswith("1\t"))
+        self.assertIn("compleasm_hmm_evidence_schema_version=2", text)
+        self.assertTrue(text.strip().splitlines()[-1].startswith("2\t"))
 
     def test_writer_bytes_do_not_depend_on_input_order(self):
         target_a, protein_a, _ = _target("AAA", "ctgA", 0, 300)
@@ -298,6 +299,99 @@ class TestHmmCandidateEvidenceWriter(unittest.TestCase):
             compleasm.write_hmm_candidate_evidence(path_ba, evidence_ba, frame)
             with open(path_ab, "rb") as handle_ab, open(path_ba, "rb") as handle_ba:
                 self.assertEqual(handle_ab.read(), handle_ba.read())
+
+    def test_raw_hmmer_record_multiplicity_survives_serialization(self):
+        """Several raw domtblout lines can belong to one candidate.
+
+        Miniprot can then expand that candidate into more than one sidecar row.
+        ``n_raw_hmmer_records`` stays the raw-line count. A reader of the TSV does
+        not need the private HMMER directory.
+        """
+        target_a, protein_a, location_a = _target("AAA", "ctg1", 10, 100)
+        target_b, protein_b, location_b = _target("BBB", "ctg2", 200, 280)
+        target_fail, _, _ = _target("FAIL", "ctg1", 1000, 1100)
+        lines = [
+            _domtbl_line(target_a, 80.0, 1, 10),
+            _domtbl_line(target_a, 80.0, 1, 10),
+            _domtbl_line(target_a, 88.0, 20, 40),
+            _domtbl_line(target_b, 60.0, 2, 12),
+            _domtbl_line(target_fail, 10.0, 1, 5),
+            _domtbl_line(target_fail, 12.0, 6, 9),
+            _domtbl_line(target_a, 80.0, 1, 10, query="not-this-busco"),
+        ]
+        folder = _write_folder([("10at2.out", lines)])
+        try:
+            _, _, _, _, evidence = compleasm.load_hmmsearch_output(folder, CUTOFF)
+        finally:
+            shutil.rmtree(folder)
+        by_target = {item["target_name"]: item for item in evidence}
+        self.assertEqual(set(by_target), {target_a, target_b})
+        self.assertEqual(by_target[target_a]["n_raw_hmmer_records"], 3)
+        self.assertEqual(by_target[target_b]["n_raw_hmmer_records"], 1)
+        self.assertEqual(len(by_target[target_a]["domains"]), 3)
+
+        frame = _miniprot_frame([
+            [protein_a, "ctg1", 10, 100, "+", 1, 0.91, 0.95, 100],
+            [protein_a, "ctg1", 10, 100, "-", 2, 0.40, 0.50, 20],
+            [protein_b, "ctg2", 200, 280, "+", 1, 0.80, 0.88, 55],
+        ])
+        with tempfile.TemporaryDirectory(prefix="compleasm-evidence-") as directory:
+            path = os.path.join(directory, "hmm_candidate_evidence.tsv")
+            compleasm.write_hmm_candidate_evidence(path, evidence, frame)
+            with open(path) as handle:
+                text = handle.read()
+            rows = _read_evidence_tsv(path)
+        self.assertFalse(os.path.exists(folder))
+        self.assertIn("# compleasm_hmm_evidence_schema_version=2\n", text)
+        header = next(line for line in text.splitlines() if not line.startswith("#"))
+        self.assertEqual(header.split("\t"), compleasm.HMM_EVIDENCE_COLUMNS)
+        self.assertEqual(len(rows), 3)
+        counts = {}
+        naive_sum = 0
+        for row in rows:
+            self.assertEqual(row["schema_version"], "2")
+            key = (row["busco_id"], row["protein_name"], row["locus_id"])
+            value = int(row["n_raw_hmmer_records"])
+            naive_sum += value
+            if key in counts:
+                self.assertEqual(counts[key], value)
+            counts[key] = value
+        self.assertEqual(counts[(BUSCO, protein_a, location_a)], 3)
+        self.assertEqual(counts[(BUSCO, protein_b, location_b)], 1)
+        self.assertEqual(naive_sum, 7)
+        self.assertEqual(sum(counts.values()), 4)
+        self.assertEqual(_raw_records_for_target_marker(rows, "ctg1", BUSCO), 3)
+        self.assertEqual(_raw_records_for_target_marker(rows, "ctg2", BUSCO), 1)
+        serialized_domains = {
+            row["hmm_domains"] for row in rows if row["protein_name"] == protein_a
+        }
+        self.assertEqual(serialized_domains, {"1-10,1-10,20-40"})
+
+
+def _read_evidence_tsv(path):
+    rows = []
+    with open(path) as handle:
+        header = None
+        for line in handle:
+            if line.startswith("#") or not line.strip():
+                continue
+            fields = line.rstrip("\n").split("\t")
+            if header is None:
+                header = fields
+                continue
+            rows.append(dict(zip(header, fields)))
+    return rows
+
+
+def _raw_records_for_target_marker(rows, contig, busco_id):
+    """Binny-facing sum: one raw-record count per candidate, not per sidecar row."""
+    counts = {}
+    for row in rows:
+        if row["contig"] != contig or row["busco_id"] != busco_id:
+            continue
+        key = (row["busco_id"], row["protein_name"], row["locus_id"])
+        counts[key] = int(row["n_raw_hmmer_records"])
+    return sum(counts.values())
 
 
 if __name__ == "__main__":

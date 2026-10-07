@@ -789,7 +789,7 @@ def load_length_cutoff(lengths_cutoff_file, odb):
     return cutoff_dict
 
 
-HMM_EVIDENCE_SCHEMA_VERSION = 1
+HMM_EVIDENCE_SCHEMA_VERSION = 2
 HMM_EVIDENCE_COLUMNS = [
     "schema_version",
     "busco_id",
@@ -805,6 +805,7 @@ HMM_EVIDENCE_COLUMNS = [
     "hmm_matched_length",
     "hmm_domains",
     "hmm_domain_count",
+    "n_raw_hmmer_records",
     "miniprot_rank",
     "miniprot_identity",
     "miniprot_positive",
@@ -869,6 +870,10 @@ def load_hmmsearch_output(hmmsearch_output_folder, cutoff_dict):
 
     Returns the historical 4-tuple plus one evidence record per retained candidate.
     Mapping keys are sorted so directory order and row order cannot change them.
+
+    ``n_raw_hmmer_records`` counts raw domtblout data lines grouped into that
+    candidate after the query-name match and before domain merging. Lines of a
+    candidate whose full-sequence score is below the BUSCO cutoff are not emitted.
     """
     grouped = {}
     for filename in sorted(os.listdir(hmmsearch_output_folder)):
@@ -912,6 +917,7 @@ def load_hmmsearch_output(hmmsearch_output_folder, cutoff_dict):
                         "tlen": tlen,
                         "hmm_score": hmm_score,
                         "domains": [],
+                        "n_raw_hmmer_records": 0,
                         "source_files": [],
                     }
                     grouped[target_name] = slot
@@ -923,6 +929,7 @@ def load_hmmsearch_output(hmmsearch_output_folder, cutoff_dict):
                 if filename not in slot["source_files"]:
                     slot["source_files"].append(filename)
                 slot["domains"].append((hmm_from, hmm_to))
+                slot["n_raw_hmmer_records"] += 1
 
     evidence = []
     reliable_mappings = {}
@@ -1017,6 +1024,7 @@ def write_hmm_candidate_evidence(output_path, evidence, miniprot_records):
                 "hmm_matched_length": str(int(item["matched_length"])),
                 "hmm_domains": domains,
                 "hmm_domain_count": str(len(item["domains"])),
+                "n_raw_hmmer_records": str(int(item["n_raw_hmmer_records"])),
                 "miniprot_rank": rank,
                 "miniprot_identity": identity,
                 "miniprot_positive": positive,
@@ -1040,6 +1048,7 @@ def write_hmm_candidate_evidence(output_path, evidence, miniprot_records):
         handle.write("# locus_id is the translated-protein location contig:start-end.\n")
         handle.write("# hmm_domains are domtblout HMM coordinates hmm_from-hmm_to, sorted.\n")
         handle.write("# hmm_matched_length uses Compleasm's to-from union, not an inclusive +1 length.\n")
+        handle.write("# n_raw_hmmer_records=raw domtblout data records grouped into this protein_name|locus_id after query-name match, before domain-interval merge and before physical-locus collapse. Repeated HMM coordinates count separately. The same integer is repeated on every Miniprot expansion of that candidate. Sum once per (busco_id, protein_name, locus_id). Not the sidecar row count and not a Miniprot/GFF feature count. Candidates below the BUSCO score cutoff are absent.\n")
         handle.write("\t".join(HMM_EVIDENCE_COLUMNS) + "\n")
         for record in output_rows:
             handle.write("\t".join(record[column] for column in HMM_EVIDENCE_COLUMNS) + "\n")

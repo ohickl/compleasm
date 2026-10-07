@@ -2,7 +2,7 @@
 
 Upstream base: `9d83c884ea977b52d99aab24417b6555f2ea5dd3` (Compleasm 0.2.9, `#68`).
 
-Fork version: `0.2.9+binny2.1` in `_version.py`. Pin the fork commit, not only this version string. `__upstream_base__` records the upstream commit above.
+Fork version: `0.2.9+binny2.2` in `_version.py`. Pin the fork commit, not only this version string. `__upstream_base__` records the upstream commit above.
 
 ## Candidate-loss bug
 
@@ -20,13 +20,15 @@ HMM filenames are sorted. Evidence rows and BUSCO ids written to the full table 
 
 Miniprot is still invoked with the default `--outs=0.95`. This fork does not change that threshold.
 
-## Sidecar schema 1
+## Sidecar schema 2
 
-Path: `<output>/<lineage>/hmm_candidate_evidence.tsv`.
+Path: `<output>/<lineage>/hmm_candidate_evidence.tsv`. This file is the Binny2 evidence surface. `full_table.tsv` remains Compleasm's classification and is not the physical-locus list.
 
-One row is one HMM-supported reference protein at one genomic locus. Columns: `schema_version`, `busco_id`, `protein_name`, `locus_id`, `contig`, `genomic_start`, `genomic_end`, `strand`, `hmm_score`, `hmm_qlen`, `hmm_tlen`, `hmm_matched_length`, `hmm_domains`, `hmm_domain_count`, `miniprot_rank`, `miniprot_identity`, `miniprot_positive`, `miniprot_score`, `source_hmm_file`.
+One row is one cutoff-passing reference protein at one genomic locus, joined to each matching Miniprot record. Columns: `schema_version`, `busco_id`, `protein_name`, `locus_id`, `contig`, `genomic_start`, `genomic_end`, `strand`, `hmm_score`, `hmm_qlen`, `hmm_tlen`, `hmm_matched_length`, `hmm_domains`, `hmm_domain_count`, `n_raw_hmmer_records`, `miniprot_rank`, `miniprot_identity`, `miniprot_positive`, `miniprot_score`, `source_hmm_file`.
 
-`locus_id` is `contig:start-end` from the translated-protein header. Contig names may contain colons; coordinates are the trailing field. `hmm_domains` is `hmm_from-hmm_to`, sorted. Header comments record schema version, fork version, and upstream base.
+`locus_id` is `contig:start-end` from the translated-protein header. Contig names may contain colons; coordinates are the trailing field. `hmm_domains` is `hmm_from-hmm_to`, sorted, and duplicate coordinates are kept. `hmm_domain_count` is the length of that serialized list. Header comments record `compleasm_hmm_evidence_schema_version`, fork version, and upstream base.
+
+`n_raw_hmmer_records` is the number of raw HMMER domtblout data records grouped into this `protein_name|locus_id` after the query-name match and before domain-interval merging or physical-locus collapse. Each non-blank, non-`#` line counts once. The same integer is repeated on every Miniprot expansion of that candidate. A `(contig, busco_id)` total is the sum of the field once per distinct `(busco_id, protein_name, locus_id)`. That total is not the sidecar row count and not a Miniprot/GFF feature count. Candidates below the BUSCO score cutoff are omitted, so their raw lines are not in the sum. When every attributable line passed the query check and the cutoff, the sum equals the unfiltered data-line count in the HMMER file.
 
 Two different reference proteins at the same coordinates remain two rows. Binny2 can collapse those to one physical locus. Two HMM-supported mappings at different coordinates remain two rows.
 
@@ -38,4 +40,4 @@ Two different reference proteins at the same coordinates remain two rows. Binny2
 
 `python3 -m unittest tests.test_hmm_candidate_retention -v`
 
-The repository has no upstream unit suite. The new tests cover two passing candidates, row-order permutations, a failing candidate placed first, multi-domain aggregation, same locus with two references, distinct loci, three passing candidates, directory order, and sidecar row order.
+The repository has no upstream unit suite. The new tests cover two passing candidates, row-order permutations, a failing candidate placed first, multi-domain aggregation, same locus with two references, distinct loci, three passing candidates, directory order, sidecar row order, and raw HMMER record multiplicity after serialization.
