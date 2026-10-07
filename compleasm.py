@@ -22,7 +22,7 @@ from enum import Enum
 from collections import defaultdict
 import pandas as pd
 import time
-from _version import __version__
+from _version import __upstream_base__, __version__
 
 
 ### utils
@@ -789,78 +789,261 @@ def load_length_cutoff(lengths_cutoff_file, odb):
     return cutoff_dict
 
 
+HMM_EVIDENCE_SCHEMA_VERSION = 1
+HMM_EVIDENCE_COLUMNS = [
+    "schema_version",
+    "busco_id",
+    "protein_name",
+    "locus_id",
+    "contig",
+    "genomic_start",
+    "genomic_end",
+    "strand",
+    "hmm_score",
+    "hmm_qlen",
+    "hmm_tlen",
+    "hmm_matched_length",
+    "hmm_domains",
+    "hmm_domain_count",
+    "miniprot_rank",
+    "miniprot_identity",
+    "miniprot_positive",
+    "miniprot_score",
+    "source_hmm_file",
+]
+
+
+def _merge_hmm_domain_length(coords, outfile):
+    """Union HMM-coordinate intervals using the upstream to-from span.
+
+    ``coords`` must already be sorted by ``(hmm_from, hmm_to)``. The length of a
+    domain is ``hmm_to - hmm_from`` (not inclusive ``+ 1``), matching Compleasm's
+    historical coverage arithmetic.
+    """
+    interval = None
+    for i, (hmm_from, hmm_to) in enumerate(coords):
+        if i == 0:
+            interval = [hmm_from, hmm_to, hmm_to - hmm_from]
+            continue
+        if hmm_from < interval[0]:
+            raise Error("Error parsing the hmmsearch output file {}.".format(outfile))
+        if hmm_from >= interval[1]:
+            interval[1] = hmm_to
+            interval[2] += hmm_to - hmm_from
+        elif hmm_to >= interval[1]:
+            interval[2] += hmm_to - interval[1]
+            interval[1] = hmm_to
+        elif hmm_to < interval[1]:
+            continue
+        else:
+            raise Error("Error parsing the hmmsearch output file {}.".format(outfile))
+    if interval is None:
+        raise Error("Error parsing the hmmsearch output file {}.".format(outfile))
+    return interval[2]
+
+
+def _split_locus(location):
+    """Split a translated-protein location ``contig:start-end``.
+
+    Contig names may contain colons. The coordinates are the trailing ``:start-end``.
+    """
+    contig, coords = location.rsplit(":", 1)
+    start, end = coords.split("-", 1)
+    return contig, int(start), int(end)
+
+
 def load_hmmsearch_output(hmmsearch_output_folder, cutoff_dict):
-    reliable_mappings = {}
-    reliable_mappings_qlen = {}
-    hmm_length_dict = {}
-    hmm_tlen_dict = {}
-    for outfile in os.listdir(hmmsearch_output_folder):
-        outfile = os.path.join(hmmsearch_output_folder, outfile)
-        with open(outfile, 'r') as fin:
-            best_protein = None
-            coords_dict = defaultdict(list)
-            best_protein_tlen = None
+    """Retain every HMM-supported candidate, grouped independently of row order.
+
+    Upstream kept only the first ``protein_name`` in each domtblout file
+    (``best_protein`` was the first name seen, not the highest score) and then
+    attributed every retained location to that protein. Alternate reference
+    proteins, including those on other genomic loci, were discarded.
+
+    Grouping is BUSCO → reference protein / target → genomic locus → HMM domains.
+    A candidate is the full target name ``protein_name|contig:start-end``. Every
+    candidate whose full-sequence score meets ``cutoff_dict[busco_name]`` is kept.
+    Domain rows of one candidate are aggregated; they do not become extra loci.
+    Two reference proteins that share a location stay as two observations of that
+    same location.
+
+    Returns the historical 4-tuple plus one evidence record per retained candidate.
+    Mapping keys are sorted so directory order and row order cannot change them.
+    """
+    grouped = {}
+    for filename in sorted(os.listdir(hmmsearch_output_folder)):
+        outfile = os.path.join(hmmsearch_output_folder, filename)
+        if not os.path.isfile(outfile):
+            continue
+        with open(outfile, "r") as fin:
             for line in fin:
-                if line.startswith('#'):
+                if line.startswith("#"):
                     continue
-                line = line.strip().split()
-                target_name = line[0]
-                query_name = line[3]
-                tlen = int(line[2])
-                qlen = int(line[5])
-                hmm_score = float(line[7])
-                hmm_from = int(line[15])
-                hmm_to = int(line[16])
-                assert hmm_to >= hmm_from
-                protein_name = target_name.split("|", maxsplit=1)[0]
+                fields = line.strip().split()
+                if not fields:
+                    continue
+                if len(fields) < 17:
+                    raise Error("Error parsing the hmmsearch output file {}.".format(outfile))
+                target_name = fields[0]
+                query_name = fields[3]
+                tlen = int(fields[2])
+                qlen = int(fields[5])
+                hmm_score = float(fields[7])
+                hmm_from = int(fields[15])
+                hmm_to = int(fields[16])
+                if hmm_to < hmm_from:
+                    raise Error("Error parsing the hmmsearch output file {}.".format(outfile))
+                protein_name, location = target_name.split("|", maxsplit=1)
                 busco_name = protein_name.split("_")[0]
                 short_busco_name = busco_name.split("at")[0]
-
                 ## query name must match the target name
                 ## odb10 HMMs use full id (e.g. "1001705at2759") while odb12/odb12.2 use short id (e.g. "1001705")
                 if query_name != busco_name and query_name != short_busco_name:
                     continue
-                ## save records of the best candidate only (maybe duplicated)
-                if best_protein is not None and best_protein != protein_name:
-                    continue
-                if hmm_score >= cutoff_dict[busco_name]:
-                    reliable_mappings[target_name] = hmm_score
-                    reliable_mappings_qlen[target_name] = qlen
-                location = target_name.split("|", maxsplit=1)[1]
-                coords_dict[location].append((hmm_from, hmm_to))
-                best_protein = protein_name
-                best_protein_tlen = tlen
-            for location in coords_dict.keys():
-                coords = coords_dict[location]
-                keyname = "{}|{}".format(best_protein, location)
-                interval = []
-                coords = sorted(coords, key=lambda x: x[0])
-                for i in range(len(coords)):
-                    hmm_from, hmm_to = coords[i]
-                    if i == 0:
-                        interval.extend([hmm_from, hmm_to, hmm_to - hmm_from])
-                    else:
-                        try:
-                            assert hmm_from >= interval[0]
-                        except:
-                            raise Error("Error parsing the hmmsearch output file {}.".format(outfile))
-                        if hmm_from >= interval[1]:
-                            interval[1] = hmm_to
-                            interval[2] += hmm_to - hmm_from
-                        elif hmm_from < interval[1] and hmm_to >= interval[1]:
-                            interval[2] += hmm_to - interval[1]
-                            interval[1] = hmm_to
-                        elif hmm_to < interval[1]:
-                            continue
-                        else:
-                            raise Error("Error parsing the hmmsearch output file {}.".format(outfile))
-                hmm_length_dict[keyname] = interval[2]
-                if best_protein_tlen is not None:
-                    hmm_tlen_dict[keyname] = best_protein_tlen
-    reliable_mappings = list(reliable_mappings.keys())
+                slot = grouped.get(target_name)
+                if slot is None:
+                    slot = {
+                        "target_name": target_name,
+                        "busco_name": busco_name,
+                        "protein_name": protein_name,
+                        "location": location,
+                        "query_name": query_name,
+                        "qlen": qlen,
+                        "tlen": tlen,
+                        "hmm_score": hmm_score,
+                        "domains": [],
+                        "source_files": [],
+                    }
+                    grouped[target_name] = slot
+                elif hmm_score > slot["hmm_score"]:
+                    slot["hmm_score"] = hmm_score
+                    slot["qlen"] = qlen
+                    slot["tlen"] = tlen
+                    slot["query_name"] = query_name
+                if filename not in slot["source_files"]:
+                    slot["source_files"].append(filename)
+                slot["domains"].append((hmm_from, hmm_to))
+
+    evidence = []
+    reliable_mappings = {}
+    reliable_mappings_qlen = {}
+    hmm_length_dict = {}
+    hmm_tlen_dict = {}
+    for target_name in sorted(grouped):
+        slot = grouped[target_name]
+        if slot["hmm_score"] < cutoff_dict[slot["busco_name"]]:
+            continue
+        domains = sorted(slot["domains"], key=lambda item: (item[0], item[1]))
+        slot["domains"] = domains
+        slot["matched_length"] = _merge_hmm_domain_length(domains, ",".join(sorted(slot["source_files"])))
+        slot["source_file"] = ",".join(sorted(slot["source_files"]))
+        evidence.append(slot)
+        reliable_mappings[target_name] = slot["hmm_score"]
+        reliable_mappings_qlen[target_name] = slot["qlen"]
+        hmm_length_dict[target_name] = slot["matched_length"]
+        hmm_tlen_dict[target_name] = slot["tlen"]
+    reliable_mappings = [item["target_name"] for item in evidence]
     if len(reliable_mappings) == 0:
         print("Warning: no reliable mappings found. All candidates do not pass the cutoff of BUSCO gene.")
-    return reliable_mappings, reliable_mappings_qlen, hmm_length_dict, hmm_tlen_dict
+    return reliable_mappings, reliable_mappings_qlen, hmm_length_dict, hmm_tlen_dict, evidence
+
+
+def _fmt_evidence_float(value):
+    return "{:.6f}".format(float(value))
+
+
+def write_hmm_candidate_evidence(output_path, evidence, miniprot_records):
+    """Write one TSV row per HMM-supported reference protein at a genomic locus.
+
+    This sidecar is not a Compleasm classification. Rows that share ``locus_id``
+    plus contig coordinates are alternative references or framings of one physical
+    interval; rows with different coordinates are separate physical candidates.
+    Compleasm's ``full_table.tsv`` is unchanged in role and may still report a
+    single classified representative.
+    """
+    by_key = defaultdict(list)
+    if miniprot_records is not None and len(miniprot_records) > 0:
+        for rx in range(len(miniprot_records)):
+            row = miniprot_records.iloc[rx]
+            key = "{}|{}:{}-{}".format(
+                row["Protein_name"], row["Contig_name"], row["Contig_Start"], row["Contig_Stop"])
+            by_key[key].append(row)
+
+    output_rows = []
+    for item in evidence:
+        matches = by_key.get(item["target_name"])
+        if not matches:
+            matches = [None]
+        else:
+            matches = sorted(matches, key=lambda row: (
+                str(row["Protein_name"]),
+                str(row["Contig_name"]),
+                int(row["Contig_Start"]),
+                int(row["Contig_Stop"]),
+                str(row["Strand"]),
+                float(row["Rank"]),
+                float(row["Identity"]),
+            ))
+        for row in matches:
+            if row is None:
+                contig, genomic_start, genomic_end = _split_locus(item["location"])
+                strand = ""
+                rank = ""
+                identity = ""
+                positive = ""
+                score = ""
+            else:
+                contig = str(row["Contig_name"])
+                genomic_start = int(row["Contig_Start"])
+                genomic_end = int(row["Contig_Stop"])
+                strand = str(row["Strand"])
+                rank = str(int(row["Rank"]))
+                identity = _fmt_evidence_float(row["Identity"])
+                positive = _fmt_evidence_float(row["Positive"])
+                score = str(int(row["Score"]))
+            domains = ",".join("{}-{}".format(start, end) for start, end in item["domains"])
+            output_rows.append({
+                "schema_version": str(HMM_EVIDENCE_SCHEMA_VERSION),
+                "busco_id": item["busco_name"],
+                "protein_name": item["protein_name"],
+                "locus_id": item["location"],
+                "contig": contig,
+                "genomic_start": str(genomic_start),
+                "genomic_end": str(genomic_end),
+                "strand": strand,
+                "hmm_score": _fmt_evidence_float(item["hmm_score"]),
+                "hmm_qlen": str(int(item["qlen"])),
+                "hmm_tlen": str(int(item["tlen"])),
+                "hmm_matched_length": str(int(item["matched_length"])),
+                "hmm_domains": domains,
+                "hmm_domain_count": str(len(item["domains"])),
+                "miniprot_rank": rank,
+                "miniprot_identity": identity,
+                "miniprot_positive": positive,
+                "miniprot_score": score,
+                "source_hmm_file": item["source_file"],
+            })
+    output_rows.sort(key=lambda record: (
+        record["busco_id"],
+        record["locus_id"],
+        record["strand"],
+        record["protein_name"],
+        record["source_hmm_file"],
+        record["hmm_score"],
+        record["hmm_domains"],
+    ))
+    with open(output_path, "w") as handle:
+        handle.write("# compleasm_hmm_evidence_schema_version={}\n".format(HMM_EVIDENCE_SCHEMA_VERSION))
+        handle.write("# compleasm_fork_version={}\n".format(__version__))
+        handle.write("# upstream_base={}\n".format(__upstream_base__))
+        handle.write("# One HMM-supported reference protein at one genomic locus per row.\n")
+        handle.write("# locus_id is the translated-protein location contig:start-end.\n")
+        handle.write("# hmm_domains are domtblout HMM coordinates hmm_from-hmm_to, sorted.\n")
+        handle.write("# hmm_matched_length uses Compleasm's to-from union, not an inclusive +1 length.\n")
+        handle.write("\t".join(HMM_EVIDENCE_COLUMNS) + "\n")
+        for record in output_rows:
+            handle.write("\t".join(record[column] for column in HMM_EVIDENCE_COLUMNS) + "\n")
+    return output_rows
 
 
 class MiniprotAlignmentParser:
@@ -1443,7 +1626,7 @@ class MiniprotAlignmentParser:
             hmmsearcher.Run(translated_proteins)
         score_cutoff_dict = load_score_cutoff(os.path.join(self.library_path, self.lineage, "scores_cutoff"))
         # TODO: records_df["Score"] is miniprot alignment score instead of hmmsearch score. hmmsearch score is stored in reliable_mappings.
-        reliable_mappings, reliable_mappings_qlen, hmm_length_dict, hmm_tlen_dict = load_hmmsearch_output(self.hmm_output_folder, score_cutoff_dict)
+        reliable_mappings, reliable_mappings_qlen, hmm_length_dict, hmm_tlen_dict, hmm_evidence = load_hmmsearch_output(self.hmm_output_folder, score_cutoff_dict)
         reliable_mappings = set(reliable_mappings)
         records_df = pd.DataFrame(records, columns=["Busco_name",
                                                     "Protein_name",
@@ -1468,6 +1651,13 @@ class MiniprotAlignmentParser:
                                                     "Atn_seq",
                                                     "Ata_seq",
                                                     "Codons"])
+        # Sidecar keeps every HMM-supported reference/locus, including candidates
+        # that Ost_eval later collapses to one classified representative.
+        write_hmm_candidate_evidence(
+            os.path.join(self.run_folder, "hmm_candidate_evidence.tsv"),
+            hmm_evidence,
+            records_df,
+        )
         all_busco_names = records_df["Busco_name"].unique().tolist()
         ## some busco protein exists in refseq_db.faa.gz, but not in hmms, discard these genes
         all_busco_names = set(all_busco_names).intersection(score_cutoff_dict.keys())
@@ -1522,10 +1712,15 @@ class MiniprotAlignmentParser:
                     raise Exception("No contigs found in the specified contigs!")
             grouped_filtered_records_df = filtered_records_df.groupby("Busco_name")
 
-            # remaining genes
-            for busco_name in filtered_busco_names:
+            # remaining genes. Sort the BUSCO id and, within a BUSCO, break I+L ties
+            # by protein and coordinates so row order cannot choose the representative.
+            for busco_name in sorted(set(filtered_busco_names)):
                 mapped_records = grouped_filtered_records_df.get_group(busco_name)
-                mapped_records = mapped_records.sort_values(by=["I+L"], ascending=False)
+                mapped_records = mapped_records.sort_values(
+                    by=["I+L", "Protein_name", "Contig_name", "Contig_Start", "Contig_Stop"],
+                    ascending=[False, True, True, True, True],
+                    kind="mergesort",
+                )
                 if self.specified_contigs is not None:
                     mapped_records = mapped_records[mapped_records["Contig_name"].isin(self.specified_contigs)]
 
@@ -1655,7 +1850,7 @@ class MiniprotAlignmentParser:
                     raise ValueError
 
         # missing genes
-        for busco_name in all_busco_names - set(filtered_busco_names):
+        for busco_name in sorted(all_busco_names - set(filtered_busco_names)):
             full_table_writer.write("{}\t{}\n".format(busco_name, GeneLabel.Missing.name))
             full_table_busco_format_writer.write("{}\t{}\n".format(busco_name, GeneLabel.Missing.name))
 
